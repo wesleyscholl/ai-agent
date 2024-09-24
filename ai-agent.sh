@@ -71,11 +71,8 @@ echo $branch_name
 # Create a new branch using the shortened ticket name
 git checkout -b $branch_name
 
-# Set branch upstream to origin/$branch_name
-git branch --set-upstream-to $branch_name origin/$branch_name
-
 # Push the new branch to the remote repository
-git push -u origin $ticket_name_short
+git push --set-upstream origin $branch_name
 
 
 # Get the current full git repo context inluding all file contents
