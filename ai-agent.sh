@@ -84,9 +84,29 @@ git push --set-upstream origin $branch_name
 #     repo_data="$repo_data"$(git show HEAD:$file)\n"  # Add file contents
 # done
 
-# echo "$repo_data"
+# Another way to get the repo context in a json format
+repo_data=$(git ls-tree -r --name-only HEAD | while read file; do echo "\"$file\": \"$(git show HEAD:$file)\""; done | paste -sd, -)
 
+echo "$repo_data"
 
+# Escape all potential problematic characters in the repo context
+repo_data=$(echo "$repo_data" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | sed 's/\n/\\n/g')
+
+# Send the repo context, ticket information, and prompt to the LLM API with specific instructions
+gemini_prompt='{
+  "contents":[{"parts":[{"text": "Using the ticket name, description, acceptance requirements, and comments, send git changes (with file names) to complete the Jira ticket. '"$ticket_name"' -- '"$description"' -- '"$acceptance_requirements"' -- '"$comments"' -- '"$repo_data"'"}]}],
+  "safetySettings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT","threshold": "BLOCK_NONE"}]
+}'
+
+# Get the LLM API response
+response=$(curl -s \
+  -H 'Content-Type: application/json' \
+  -d "$gemini_prompt" \
+  -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}"
+  )
+
+# Extract the response content
+echo $response
 
 
 
