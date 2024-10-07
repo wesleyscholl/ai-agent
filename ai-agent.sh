@@ -27,17 +27,17 @@ ticket_name=$(echo $ticket | jq -r '.issues[0].fields.summary')
 echo $ticket_name
 
 # Extract the ticket description from the response
-description=$(echo $ticket | jq -r '.issues[0].fields.description')
-acceptance_requirements=$(echo $ticket | jq -r '.issues[0].fields.customfield_12700')
-comments=$(echo $ticket | jq -r '.issues[0].fields.comment.comments[] | select(.body != "") | ("- " ) + .body')
+description=$(echo $ticket | jq -r '.issues[0].fields.description.content[0].content[0].text')
+acceptance_requirements=$(echo $ticket | jq -r '.issues[0].fields.customfield_12700.content[0].content[0].text')
+# comments=$(echo $ticket | jq -r '.issues[0].fields.comment.comments[] | select(.body != "") | ("- " ) + .body')
 # steps_to_reproduce=$(echo $ticket | jq -r '.issues[0].fields.customfield_13380')
 
 echo $description
 echo $acceptance_requirements
-echo $comments
+# echo $comments
 # echo $steps_to_reproduce
 
-# Prepare the Gemini API request - Combine into a single string - <Ticket Name> - Replace all spaces with dashes and remove all non-alphanumeric characters, limiting to 20 characters cut at the last word, remove all | pipes, remove all spaces first
+# Prepare the Gemini API request to generate a branch name
 gemini_request='{
   "contents":[{"parts":[{"text": "Write a valid git branch title (no more than 20 characters total) using this ticket name: '"$ticket_name"' Valid branch names are connected with dashes <branch-name>. The repository name can only contain ASCII letters, digits, and the characters ., -, and _. Do not include any other text in the repsonse."}]}],
   "safetySettings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT","threshold": "BLOCK_NONE"}],
@@ -63,6 +63,9 @@ if [ -z "$ticket_name_short" ]; then
     exit 1
 fi
 
+# Trim whitespace from the ticket name
+ticket_name_short=$(echo $ticket_name_short | tr -d '[:space:]')
+
 # Combine the ticket number and ticket name into a single string - <Ticket Number>-<Ticket Name>
 branch_name="$ticket_number-$ticket_name_short"
 
@@ -74,52 +77,115 @@ git checkout -b $branch_name
 # Push the new branch to the remote repository
 git push --set-upstream origin $branch_name
 
+# Update ticket status to "In Progress"
+curl -X POST \
+  --url "{$JIRA_BASE_URL}{$JIRA_API_VERSION}/issue/{$ticket_number}/transitions" \
+  --user $JIRA_USERNAME:$JIRA_API_TOKEN \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --data '{"transition":{"id":"11"}}'
+  
+# Get the repo context
+repo_context=$(git ls-tree -r --name-only HEAD | while read file; do echo "\"$file\": \"$(git show HEAD:$file)\""; done | paste -sd, -)
 
-# Get the current full git repo context inluding all file contents
-# repo_data=""
+# Encode the repo context using base64
+repo_context_encoded=$(echo "$repo_context" | base64)
 
-# for file in $(git ls-tree -r --name-only HEAD); do
-#     repo_data="$repo_data"  # Append to the existing variable
-#     repo_data="$repo_data"File: $file\n"  
-#     repo_data="$repo_data"$(git show HEAD:$file)\n"  # Add file contents
-# done
+# Construct the request body
+request_body='{
+  "contents": [{"parts": [{"text": "'"$repo_context_encoded"' "}]}]
+}'
 
-# Another way to get the repo context in a json format
-repo_data=$(git ls-tree -r --name-only HEAD | while read file; do echo "\"$file\": \"$(git show HEAD:$file)\""; done | paste -sd, -)
+# Upload the repo context using the POST method
+response=$(curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d "$request_body" \
+  "https://generativelanguage.googleapis.com/v1beta/cachedContents?key=${GEMINI_API_KEY}"
+)
 
-echo "$repo_data"
+# Extract the cached content ID from the response
+cached_content_id=$(echo "$response" | jq -r '.name')
 
-# Escape all potential problematic characters in the repo context
-repo_data=$(echo "$repo_data" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | sed 's/\n/\\n/g')
+# echo $repo_data
 
 # Send the repo context, ticket information, and prompt to the LLM API with specific instructions
 gemini_prompt='{
-  "contents":[{"parts":[{"text": "Using the ticket name, description, acceptance requirements, and comments, send git changes (with file names) to complete the Jira ticket. '"$ticket_name"' -- '"$description"' -- '"$acceptance_requirements"' -- '"$comments"' -- '"$repo_data"'"}]}],
+  "tools": [{"code_execution": {}}],
+  "contents":[{"parts": [{"text": "Using the ticket name, description, acceptance requirements, and repo data send git changes (with file names) to complete the Jira ticket in a structured JSON format. For each file, provide the file path (filepath), a diff that represents the changes, and the updated_content for the entire file. Escape all potentially problematic characters. Respond in this format: changes: [{file1.py: {filepath: file1.py, diff: git diff, updated_content: updates}, file2.txt: {filepath: file2.txt, diff: git diff, updated_content: updates}}]. -- Ticket name: '"$ticket_name"' -- Ticket Description: '"$description"' -- Acceptance Requirements: '"$acceptance_requirements"' -- Repo Context: '"$cached_content_id"' -- Do not include any other text in the repsonse."}]}],
   "safetySettings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT","threshold": "BLOCK_NONE"}]
 }'
 
-# Get the LLM API response
+# Get the Gemini API changes response
 response=$(curl -s \
   -H 'Content-Type: application/json' \
-  -d "$gemini_prompt" \
+  -d $gemini_prompt \
   -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}"
   )
 
-# Extract the response content
 echo $response
 
+# Check if the response is empty
+if [ -z "$response" ]; then
+    echo "Error: Gemini API request failed. Please try again."
+    exit 1
+fi
+
+# Check if the response contains the expected structure - 'changes' key with file names as sub-keys
+if [ -z $(echo $response | jq -r '.candidates[0].content.parts[0].text | fromjson | .changes') ]; then
+    echo "Error: Gemini API response does not contain the expected structure. Please try again."
+    exit 1
+else
+    # for each object within changes, check for keys and values: 'filepath', 'diff', and 'updated_content'
+    for file in $(echo $response | jq -r '.candidates[0].content.parts[0].text | fromjson | .changes | keys[]'); do
+        if [ -z $(echo $response | jq -r ".candidates[0].content.parts[0].text | fromjson | .changes | .$file | .filepath") ] || 
+           [ -z $(echo $response | jq -r ".candidates[0].content.parts[0].text | fromjson | .changes | .$file | .diff") ] || 
+           [ -z $(echo $response | jq -r ".candidates[0].content.parts[0].text | fromjson | .changes | .$file | .updated_content") ]; then
+            echo "Error: Gemini API response does not contain the expected structure - filepath, diff and updated_content. Please try again."
+            exit 1
+        fi
+    done
+fi
+
+# Parse the response to get the file names, diffs, and updated content
+file_names=$(echo $response | jq -r '.candidates[0].content.parts[0].text | fromjson | .changes | keys[]')
+file_diffs=$(echo $response | jq -r '.candidates[0].content.parts[0].text | fromjson | .changes | .[] | .diff')
+file_contents=$(echo $response | jq -r '.candidates[0].content.parts[0].text | fromjson | .changes | .[] | .updated_content')
+
+echo $file_names
+echo $file_diffs
+echo $file_contents
 
 
+# Loop through the files and apply the changes
+for file in $file_names; do
+    # Get the updated content for the file
+    updated_content=$(echo $file_contents | jq -r ".$file.updated_content")
 
+    # Write the updated content to the file
+    echo "$updated_content" > $file
+done
 
+# Run the git commit push script with the alias 'cm'
+cm
 
+# Wait for the changes to be pushed to the remote repository
+sleep 5
 
+# Run unit tests to ensure the changes are valid and don't break the codebase
+# TODO: Add unit test runner
 
+# # Update ticket status to "Code Review"
+curl -X POST \
+  --url "{$JIRA_BASE_URL}{$JIRA_API_VERSION}/issue/{$ticket_number}/transitions" \
+  --user $JIRA_USERNAME:$JIRA_API_TOKEN \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --data '{"transition":{"id":"71"}}'
 
+# Run the jira pr script with the alias 'pr'
+pr main
 
-# - Parse the ticket description, acceptance criteria, name, other details
-# - Clone corresponding repo from ticket - Url could be 2nd argument/parameter
-# - Checkout new branch using the name of the ticket, shortened
-# - Send ticket details and repo context to LLM API with specific instructions 
-# - Specific instructions, to return file names to modify, full code for files to modify (with new code), the response structure needs to be predictable
+# Wait for the pull request to be created
+sleep 5
 
+echo "Pull request created successfully."
